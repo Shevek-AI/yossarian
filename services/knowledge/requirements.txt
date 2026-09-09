@@ -1,0 +1,5 @@
+fastapi==0.141.1
+uvicorn==0.52.4
+httpx==0.28.1
+asyncpg==0.31.0
+fastembed==0.8.0

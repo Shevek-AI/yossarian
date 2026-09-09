@@ -1,0 +1,11 @@
+.env
+*.log
+.DS_Store
+.runtime-secrets/
+.runtime-keycloak-import/
+
+__pycache__/
+*.pyc
+
+# Local meeting transcripts/summaries may contain sensitive content.
+artifacts/meetings/

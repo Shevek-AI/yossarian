@@ -1,0 +1,596 @@
+name: ${RUNTIME_NAME:-yossarian-dev}
+
+services:
+  vllm:
+    image: ${VLLM_IMAGE}
+    restart: unless-stopped
+    gpus: all
+    ipc: host
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+      VLLM_API_KEY: ${VLLM_API_KEY}
+    volumes:
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+    # vLLM's image entrypoint is `vllm serve`; the model is positional in 0.28+.
+    command:
+      - ${VLLM_MODEL}
+      - --served-model-name
+      - ${VLLM_SERVED_MODEL}
+      - --api-key
+      - ${VLLM_API_KEY}
+      - --max-model-len
+      - ${VLLM_MAX_MODEL_LEN:-8192}
+      - --gpu-memory-utilization
+      - ${VLLM_GPU_MEMORY_UTILIZATION:-0.80}
+      - --reasoning-parser
+      - ${VLLM_REASONING_PARSER:-qwen3}
+      # LibreChat/MCP sends OpenAI tool_choice=auto. vLLM rejects that unless
+      # automatic tool choice and a model-compatible tool parser are enabled.
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - ${VLLM_TOOL_CALL_PARSER:-hermes}
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()"
+      interval: 5s
+      timeout: 3s
+      retries: 120
+      start_period: 30s
+    networks:
+      - runtime
+
+  litellm:
+    image: ${LITELLM_IMAGE}
+    restart: unless-stopped
+    depends_on:
+      vllm:
+        condition: service_healthy
+    environment:
+      VLLM_API_KEY: ${VLLM_API_KEY}
+      VLLM_MODEL: ${VLLM_MODEL}
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      RUNTIME_VERSION: ${RUNTIME_VERSION:-0.1.0}
+      RUNTIME_AUDIT_LOG_PATH: /var/lib/runtime-audit/audit.jsonl
+    volumes:
+      - ./config/litellm.yaml:/app/config.yaml:ro
+      - ./config/litellm_callbacks.py:/app/custom_callbacks.py:ro
+      - runtime_audit:/var/lib/runtime-audit
+    command:
+      - --config=/app/config.yaml
+      - --port=4000
+      - --num_workers=1
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness', timeout=2).read()"
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 5s
+    ports:
+      - 127.0.0.1:${LITELLM_HOST_PORT:-4000}:4000
+    networks:
+      - runtime
+
+  postgres:
+    image: ${POSTGRES_IMAGE}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-runtime}
+      POSTGRES_USER: ${POSTGRES_USER:-runtime}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - knowledge_postgres:/var/lib/postgresql
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U ${POSTGRES_USER:-runtime} -d ${POSTGRES_DB:-runtime}
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+    networks:
+      - runtime
+
+  knowledge:
+    build:
+      context: ./services/knowledge
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      litellm:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-runtime}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-runtime}
+      LITELLM_URL: http://litellm:4000
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      KNOWLEDGE_QUERY_TOKEN: ${KNOWLEDGE_QUERY_TOKEN}
+      KNOWLEDGE_EMBED_MODEL: ${KNOWLEDGE_EMBED_MODEL:-BAAI/bge-small-en-v1.5}
+      KNOWLEDGE_EMBED_CACHE_DIR: /models
+      KNOWLEDGE_INGEST_TOKEN_FILE: /run/secrets/knowledge_ingest_token
+    volumes:
+      - knowledge_models:/models
+      - ./.runtime-secrets/knowledge_ingest_token:/run/secrets/knowledge_ingest_token:ro
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=2).read()"
+      interval: 5s
+      timeout: 3s
+      retries: 120
+      start_period: 15s
+    networks:
+      - runtime
+
+  # Development source connector. Explicitly invoked with `make ingest`; it is
+  # not part of the long-running runtime and cannot write Postgres directly.
+  ingest:
+    build:
+      context: ./services/ingest
+    profiles:
+      - tools
+    depends_on:
+      knowledge:
+        condition: service_healthy
+    volumes:
+      - ./fixtures/knowledge:/source:ro
+      - ./.runtime-secrets/knowledge_ingest_token:/run/secrets/knowledge_ingest_token:ro
+    networks:
+      - runtime
+
+  # Local/OpenAI-compatible speech stack. CPU-only in this development slice
+  # so it cannot starve vLLM of GPU memory. Startup provisions every model
+  # required by enabled STT/diarization capabilities into the persistent cache.
+  speaches:
+    image: ${SPEACHES_IMAGE}
+    restart: unless-stopped
+    environment:
+      API_KEY: ${SPEACHES_API_KEY}
+      HF_TOKEN: ${HF_TOKEN:-}
+      PYANNOTE_METRICS_ENABLED: "0"
+      SPEACHES_STT_MODEL: ${SPEACHES_STT_MODEL}
+      SPEACHES_ENABLE_DIARIZATION: ${SPEACHES_ENABLE_DIARIZATION:-1}
+      SPEACHES_DIARIZATION_SEGMENTATION_MODEL: ${SPEACHES_DIARIZATION_SEGMENTATION_MODEL:-fedirz/segmentation_community_1}
+      SPEACHES_DIARIZATION_EMBEDDING_MODEL: ${SPEACHES_DIARIZATION_EMBEDDING_MODEL:-Wespeaker/wespeaker-voxceleb-resnet34-LM}
+      SPEACHES_EXTRA_MODELS: ${SPEACHES_EXTRA_MODELS:-}
+      ENABLE_UI: "false"
+      LOG_LEVEL: info
+      WHISPER__INFERENCE_DEVICE: cpu
+      WHISPER__COMPUTE_TYPE: int8
+      STT_MODEL_TTL: ${SPEACHES_STT_MODEL_TTL:--1}
+    volumes:
+      - speaches_models:/home/ubuntu/.cache/huggingface/hub
+      - ./fixtures/audio:/fixtures/audio:ro
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()"
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 10s
+    networks:
+      - runtime
+
+  # Long-running meeting resource service. Upload/record/import mechanisms are
+  # clients of this boundary; this service owns asynchronous processing, draft
+  # artifacts, review state, and explicit publication into governed knowledge.
+  meetings:
+    build:
+      context: ./services/meeting
+    restart: unless-stopped
+    depends_on:
+      speaches:
+        condition: service_healthy
+      litellm:
+        condition: service_healthy
+      knowledge:
+        condition: service_healthy
+    environment:
+      SPEACHES_URL: http://speaches:8000
+      SPEACHES_API_KEY: ${SPEACHES_API_KEY}
+      SPEACHES_STT_MODEL: ${SPEACHES_STT_MODEL}
+      LITELLM_URL: http://litellm:4000
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      KNOWLEDGE_URL: http://knowledge:8090
+      KNOWLEDGE_INGEST_TOKEN_FILE: /run/secrets/knowledge_ingest_token
+      MEETING_API_TOKEN_FILE: /run/secrets/meeting_api_token
+      MEETING_DATA_ROOT: /var/lib/runtime-meetings
+      MEETING_MAX_UPLOAD_BYTES: ${MEETING_MAX_UPLOAD_BYTES:-2147483648}
+      MEETING_SUMMARY_MODEL: ${MEETING_SUMMARY_MODEL:-general}
+      MEETING_NORMALIZE_MODEL: ${MEETING_NORMALIZE_MODEL:-general}
+    volumes:
+      - meetings_data:/var/lib/runtime-meetings
+      - ./.runtime-secrets/meeting_api_token:/run/secrets/meeting_api_token:ro
+      - ./.runtime-secrets/knowledge_ingest_token:/run/secrets/knowledge_ingest_token:ro
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8091/health', timeout=2).read()"
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 5s
+    ports:
+      - 127.0.0.1:${MEETINGS_HOST_PORT:-8091}:8091
+    networks:
+      - runtime
+
+  # Development identity provisioning. Fresh realms import the web client from
+  # realm JSON; this idempotent tool also upgrades already-persistent dev realms.
+  oidc-provision:
+    build:
+      context: ./services/oidc_provision
+    profiles:
+      - tools
+    depends_on:
+      keycloak:
+        condition: service_healthy
+    environment:
+      KEYCLOAK_INTERNAL_URL: http://keycloak:8080
+      KEYCLOAK_REALM: ${KEYCLOAK_REALM}
+      KEYCLOAK_ADMIN_USER: ${KEYCLOAK_ADMIN_USER:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+      WEB_OIDC_CLIENT_ID: ${WEB_OIDC_CLIENT_ID}
+      WEB_OIDC_CLIENT_SECRET: ${WEB_OIDC_CLIENT_SECRET}
+      WEB_PUBLIC_URL: ${WEB_PUBLIC_URL}
+      WEB_DEV_ADMIN_USERNAME: allowed-user
+      WEB_OIDC_ADMIN_ROLE: ${WEB_OIDC_ADMIN_ROLE:-runtime-admin}
+    networks:
+      - runtime
+
+  # Controlled public-web egress exposed to LibreChat as a private MCP tool.
+  # This service is intentionally isolated onto the tooling network: it can
+  # reach the public search provider but has no direct path to runtime data
+  # stores/inference services. It exposes search-result metadata only and never
+  # fetches arbitrary result URLs.
+  web-search:
+    build:
+      context: ./services/web_search
+    restart: unless-stopped
+    environment:
+      WEB_SEARCH_ENABLED: ${WEB_SEARCH_ENABLED:-0}
+      WEB_SEARCH_PROVIDER: ${WEB_SEARCH_PROVIDER:-brave}
+      BRAVE_SEARCH_API_KEY: ${BRAVE_SEARCH_API_KEY:-}
+      WEB_SEARCH_COUNTRY: ${WEB_SEARCH_COUNTRY:-AU}
+      WEB_SEARCH_LANGUAGE: ${WEB_SEARCH_LANGUAGE:-en}
+      WEB_SEARCH_MAX_RESULTS: ${WEB_SEARCH_MAX_RESULTS:-6}
+      WEB_SEARCH_TIMEOUT_SECONDS: ${WEB_SEARCH_TIMEOUT_SECONDS:-15}
+      WEB_SEARCH_MAX_REQUESTS_PER_MINUTE: ${WEB_SEARCH_MAX_REQUESTS_PER_MINUTE:-10}
+      WEB_SEARCH_MAX_REQUESTS_PER_HOUR: ${WEB_SEARCH_MAX_REQUESTS_PER_HOUR:-50}
+      WEB_SEARCH_MAX_REQUESTS_PER_DAY: ${WEB_SEARCH_MAX_REQUESTS_PER_DAY:-100}
+      RUNTIME_AUDIT_LOG_PATH: /var/lib/runtime-audit/audit.jsonl
+    volumes:
+      - runtime_audit:/var/lib/runtime-audit
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8092/health', timeout=2).read()"
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    networks:
+      - tooling
+
+  # Thin browser control surface / BFF. Browser clients never receive internal
+  # service bearer tokens; OIDC terminates here and downstream calls are made
+  # server-side on the caller's behalf.
+  web:
+    build:
+      context: ./services/web
+    restart: unless-stopped
+    depends_on:
+      meetings:
+        condition: service_healthy
+      knowledge:
+        condition: service_healthy
+      speaches:
+        condition: service_healthy
+      litellm:
+        condition: service_healthy
+      web-search:
+        condition: service_healthy
+      caddy-ca-export:
+        condition: service_completed_successfully
+    environment:
+      RUNTIME_VERSION: ${RUNTIME_VERSION:-0.1.0}
+      WEB_PUBLIC_URL: ${WEB_PUBLIC_URL:-http://localhost:8080}
+      WEB_OIDC_ISSUER: ${KEYCLOAK_PUBLIC_URL}/realms/${KEYCLOAK_REALM}
+      WEB_OIDC_CLIENT_ID: ${WEB_OIDC_CLIENT_ID}
+      WEB_OIDC_CLIENT_SECRET: ${WEB_OIDC_CLIENT_SECRET}
+      WEB_OIDC_REQUIRED_ROLE: ${WEB_OIDC_REQUIRED_ROLE:-runtime-user}
+      WEB_OIDC_ADMIN_ROLE: ${WEB_OIDC_ADMIN_ROLE:-runtime-admin}
+      WEB_SESSION_SECRET: ${WEB_SESSION_SECRET}
+      WEB_COOKIE_SECURE: ${WEB_COOKIE_SECURE:-0}
+      WEB_OIDC_CA_CERT: /certs/root.crt
+      MEETINGS_URL: http://meetings:8091
+      KNOWLEDGE_URL: http://knowledge:8090
+      LITELLM_URL: http://litellm:4000
+      SPEACHES_URL: http://speaches:8000
+      PROMETHEUS_URL: http://prometheus:9090
+      LIBRECHAT_INTERNAL_URL: http://librechat:3080
+      LIBRECHAT_PUBLIC_URL: ${LIBRECHAT_PUBLIC_URL:-http://localhost:3080}
+      WEB_SEARCH_URL: http://web-search:8092
+      MEETING_API_TOKEN_FILE: /run/secrets/meeting_api_token
+      KNOWLEDGE_QUERY_TOKEN: ${KNOWLEDGE_QUERY_TOKEN}
+      RUNTIME_AUDIT_LOG_PATH: /var/lib/runtime-audit/audit.jsonl
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      SPEACHES_API_KEY: ${SPEACHES_API_KEY}
+    volumes:
+      - ./.runtime-secrets/meeting_api_token:/run/secrets/meeting_api_token:ro
+      - runtime_audit:/var/lib/runtime-audit:ro
+      - shared_ca:/certs:ro
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2).read()"
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 5s
+    ports:
+      - 127.0.0.1:${WEB_HOST_PORT:-8080}:8080
+    networks:
+      - runtime
+      - tooling
+
+  dcgm-exporter:
+    image: ${DCGM_EXPORTER_IMAGE}
+    restart: unless-stopped
+    gpus: all
+    cap_add:
+      - SYS_ADMIN
+    networks:
+      - runtime
+
+  prometheus:
+    image: ${PROMETHEUS_IMAGE}
+    restart: unless-stopped
+    depends_on:
+      litellm:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+      dcgm-exporter:
+        condition: service_started
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-7d}
+    volumes:
+      - ./config/prometheus.yaml:/etc/prometheus/prometheus.yml:ro
+      - ./.runtime-secrets/litellm_master_key:/run/secrets/litellm_master_key:ro
+      - prometheus_data:/prometheus
+    group_add:
+      - ${PROMETHEUS_SECRET_GID}
+    ports:
+      - 127.0.0.1:${PROMETHEUS_HOST_PORT:-9090}:9090
+    networks:
+      - runtime
+
+  # LibreChat's MongoDB is authenticated and isolated onto a single-purpose
+  # internal network. The bootstrap entrypoint upgrades existing unauthenticated
+  # development volumes over loopback before starting the network listener with auth.
+  mongodb:
+    image: ${MONGODB_IMAGE}
+    restart: unless-stopped
+    environment:
+      MONGODB_APP_USERNAME: ${MONGODB_APP_USERNAME:-librechat}
+      MONGODB_APP_PASSWORD: ${MONGODB_APP_PASSWORD}
+    entrypoint:
+      - /bin/bash
+      - /opt/runtime/mongodb-entrypoint.sh
+    volumes:
+      - librechat_mongodb:/data/db
+      - ./services/mongodb/entrypoint.sh:/opt/runtime/mongodb-entrypoint.sh:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          mongosh --quiet --norc
+          "mongodb://$${MONGODB_APP_USERNAME}:$${MONGODB_APP_PASSWORD}@127.0.0.1:27017/LibreChat?authSource=LibreChat"
+          --eval "db.adminCommand('ping').ok" >/dev/null
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 15s
+    networks:
+      - librechat-data
+
+  keycloak:
+    image: ${KEYCLOAK_IMAGE}
+    restart: unless-stopped
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USER:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+      KC_HEALTH_ENABLED: "true"
+      KC_METRICS_ENABLED: "true"
+      KC_HOSTNAME: ${KEYCLOAK_PUBLIC_URL}
+      KC_PROXY_HEADERS: xforwarded
+      KEYCLOAK_REALM: ${KEYCLOAK_REALM}
+      LIBRECHAT_OIDC_CLIENT_ID: ${LIBRECHAT_OIDC_CLIENT_ID}
+      LIBRECHAT_OIDC_CLIENT_SECRET: ${LIBRECHAT_OIDC_CLIENT_SECRET}
+      LIBRECHAT_PUBLIC_URL: ${LIBRECHAT_PUBLIC_URL}
+      KEYCLOAK_TEST_USER_PASSWORD: ${KEYCLOAK_TEST_USER_PASSWORD}
+      WEB_OIDC_CLIENT_ID: ${WEB_OIDC_CLIENT_ID}
+      WEB_OIDC_CLIENT_SECRET: ${WEB_OIDC_CLIENT_SECRET}
+      WEB_PUBLIC_URL: ${WEB_PUBLIC_URL}
+    command:
+      - start-dev
+      - --import-realm
+    volumes:
+      - keycloak_data:/opt/keycloak/data
+      - ./.runtime-keycloak-import:/opt/keycloak/data/import:ro
+    healthcheck:
+      test:
+        - CMD
+        - bash
+        - -c
+        - "{ printf 'HEAD /health/ready HTTP/1.0\\r\\n\\r\\n' >&0; grep 'HTTP/1.0 200'; } 0<>/dev/tcp/127.0.0.1/9000"
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 20s
+    networks:
+      - runtime
+
+  caddy:
+    image: ${CADDY_IMAGE}
+    restart: unless-stopped
+    depends_on:
+      keycloak:
+        condition: service_healthy
+    volumes:
+      - ./config/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - test -s /data/caddy/pki/authorities/local/root.crt
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 2s
+    ports:
+      - 127.0.0.1:${KEYCLOAK_TLS_HOST_PORT:-8443}:8443
+    networks:
+      runtime:
+        aliases:
+          - auth.localhost
+
+  caddy-ca-export:
+    image: alpine:3.22
+    restart: "no"
+    depends_on:
+      caddy:
+        condition: service_healthy
+    volumes:
+      - caddy_data:/caddy-data:ro
+      - shared_ca:/shared-ca
+    command:
+      - sh
+      - -ec
+      - |
+        src=/caddy-data/caddy/pki/authorities/local/root.crt
+        until [ -s "$$src" ]; do sleep 1; done
+        cp "$$src" /shared-ca/root.crt
+        chmod 0644 /shared-ca/root.crt
+        test -s /shared-ca/root.crt
+    networks:
+      - runtime
+
+  librechat:
+    image: ${LIBRECHAT_IMAGE}
+    restart: unless-stopped
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      litellm:
+        condition: service_healthy
+      knowledge:
+        condition: service_healthy
+      speaches:
+        condition: service_healthy
+      web-search:
+        condition: service_healthy
+      caddy:
+        condition: service_healthy
+      caddy-ca-export:
+        condition: service_completed_successfully
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3080
+      MONGO_URI: mongodb://${MONGODB_APP_USERNAME:-librechat}:${MONGODB_APP_PASSWORD}@mongodb:27017/LibreChat?authSource=LibreChat
+      DOMAIN_CLIENT: ${LIBRECHAT_PUBLIC_URL:-http://localhost:3080}
+      DOMAIN_SERVER: ${LIBRECHAT_PUBLIC_URL:-http://localhost:3080}
+      APP_TITLE: ${LIBRECHAT_APP_TITLE:-Yossarian}
+      NO_INDEX: "true"
+      SEARCH: "false"
+      ENDPOINTS: custom
+      CONFIG_PATH: /app/librechat.yaml
+
+      # Keep the existing local account as a development break-glass path while
+      # proving OIDC. New local registration is disabled from this slice onward.
+      ALLOW_EMAIL_LOGIN: "true"
+      ALLOW_REGISTRATION: "false"
+      ALLOW_SOCIAL_LOGIN: "true"
+      ALLOW_SOCIAL_REGISTRATION: "true"
+      ALLOW_PASSWORD_RESET: "false"
+      ALLOW_UNVERIFIED_EMAIL_LOGIN: "false"
+      SESSION_COOKIE_SECURE: "false"
+      LOGIN_MAX: ${LOGIN_MAX:-50}
+      LOGIN_WINDOW: ${LOGIN_WINDOW:-1}
+
+      OPENID_CLIENT_ID: ${LIBRECHAT_OIDC_CLIENT_ID}
+      OPENID_CLIENT_SECRET: ${LIBRECHAT_OIDC_CLIENT_SECRET}
+      OPENID_ISSUER: ${KEYCLOAK_PUBLIC_URL}/realms/${KEYCLOAK_REALM}
+      OPENID_SESSION_SECRET: ${LIBRECHAT_OIDC_SESSION_SECRET}
+      OPENID_CALLBACK_URL: /oauth/openid/callback
+      OPENID_SCOPE: "openid profile email"
+      OPENID_BUTTON_LABEL: "Sign in with SSO"
+      OPENID_REQUIRED_ROLE: ${LIBRECHAT_OIDC_REQUIRED_ROLE:-runtime-user}
+      OPENID_REQUIRED_ROLE_TOKEN_KIND: access
+      OPENID_REQUIRED_ROLE_PARAMETER_PATH: realm_access.roles
+      OPENID_USE_END_SESSION_ENDPOINT: "true"
+
+      # Caddy's development CA signs auth.localhost. A one-shot helper copies
+      # only the public CA certificate into a separate readable volume;
+      # LibreChat never gets access to Caddy's private key material.
+      NODE_EXTRA_CA_CERTS: /certs/root.crt
+
+      CREDS_KEY: ${LIBRECHAT_CREDS_KEY}
+      CREDS_IV: ${LIBRECHAT_CREDS_IV}
+      JWT_SECRET: ${LIBRECHAT_JWT_SECRET}
+      JWT_REFRESH_SECRET: ${LIBRECHAT_JWT_REFRESH_SECRET}
+      KNOWLEDGE_QUERY_TOKEN: ${KNOWLEDGE_QUERY_TOKEN}
+      SPEACHES_API_KEY: ${SPEACHES_API_KEY}
+      SPEACHES_STT_MODEL: ${SPEACHES_STT_MODEL}
+    volumes:
+      - ./config/librechat.yaml:/app/librechat.yaml:ro
+      - shared_ca:/certs:ro
+    ports:
+      - 127.0.0.1:${LIBRECHAT_HOST_PORT:-3080}:3080
+    networks:
+      - runtime
+      - tooling
+      - librechat-data
+
+networks:
+  runtime:
+    driver: bridge
+  tooling:
+    driver: bridge
+  librechat-data:
+    driver: bridge
+    internal: true
+
+volumes:
+  librechat_mongodb:
+  caddy_data:
+  caddy_config:
+  shared_ca:
+  runtime_audit:
+  prometheus_data:
+  keycloak_data:
+  knowledge_postgres:
+  knowledge_models:
+  speaches_models:
+  meetings_data:

@@ -1,0 +1,22 @@
+model_list:
+  - model_name: general
+    litellm_params:
+      model: openai/local-general
+      api_base: http://vllm:8000/v1
+      api_key: os.environ/VLLM_API_KEY
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+
+litellm_settings:
+  drop_params: true
+  set_verbose: false
+  # Metrics are exposed on /metrics for Prometheus. The custom callback writes
+  # a deliberately content-free append-only audit record.
+  callbacks:
+    - prometheus
+    - custom_callbacks.audit_handler
+  # Never send prompt/response bodies to logging callbacks by default.
+  turn_off_message_logging: true
+  # Audit is a governance control: clients cannot opt out with no-log=true.
+  global_disable_no_log_param: true
